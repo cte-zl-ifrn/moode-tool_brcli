@@ -19,6 +19,7 @@ list($options, $unrecognized) = cli_get_params(array(
     'destination' => '',
     'users' => 0,
     'anonymize' => 0,
+    'all' => false,
     'help' => false,
     ), array('h' => 'help'));
 
@@ -27,7 +28,7 @@ if ($unrecognized) {
     cli_error(get_string('unknowoption', 'tool_brcli', $unrecognized));
 }
 
-if ($options['help'] || !($options['categoryid']) || !($options['destination'])) {
+if ($options['help'] || (!$options['all'] && !$options['categoryid']) || !$options['destination']) {
     echo get_string('helpoptionbck', 'tool_brcli');
     die;
 }
@@ -43,12 +44,20 @@ if (empty($dir) || !file_exists($dir) || !is_dir($dir) || !is_writable($dir)) {
     cli_error(get_string('directoryerror', 'tool_brcli'));
 }
 
-// Check that the category exists.
-if ($DB->count_records('course_categories', array('id'=>$options['categoryid'])) == 0) {
-    cli_error(get_string('nocategory', 'tool_brcli'));
-} 
+if (!$options['all']) {
+    // Check that the category exists.
+    if ($DB->count_records('course_categories', array('id'=>$options['categoryid'])) == 0) {
+        cli_error(get_string('nocategory', 'tool_brcli'));
+    } 
 
-$courses = $DB->get_records('course', array('category'=>$options['categoryid']));
+    // Get courses within category.
+    $courses = $DB->get_records('course', array('category' => $options['categoryid']));
+}
+
+if ($options['all']) {
+    // Get ALL courses except frontpage.
+    $courses = $DB->get_records_select('course', 'id > 1');
+}
 $amount_of_courses = count($courses);
 
 $index = 1;
