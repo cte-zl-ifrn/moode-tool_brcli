@@ -29,6 +29,7 @@ Opções:
 --destination=STRING        Caminho onde os arquivos de backup serão armazenados.
 --users=0|1                 Incluir usuários no backup (padrão: 0).
 --anonymize=0|1             Anonimiza os dados dos usuários (aplicável apenas quando --users=1).
+--no-recursive              Não inclui cursos de subcategorias (apenas a categoria informada).
 -h, --help                  Exibe esta ajuda.
 
 Observações:
@@ -45,9 +46,9 @@ Backup de todos os cursos com usuários anonimizados:
     php admin/tool/brcli/backup.php --all --destination=/moodle/backup/ --users=1 --anonymize=1
 
 Backup dos cursos de uma categoria específica:
-    php admin/tool/brcli/backup.php --categoryid=3 --destination=/moodle/backup/
+    php admin/tool/brcli/backup.php --categoryid=3 --destination=/moodle/backup/ --no-recursive
 
-Backup de cursos de uma categoria com usuários:
+Backup de cursos de uma categoria e subcategorias com usuários:
     php admin/tool/brcli/backup.php --categoryid=3 --destination=/moodle/backup/ --users=1
 ';
 

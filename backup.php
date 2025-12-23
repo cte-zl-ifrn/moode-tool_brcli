@@ -20,6 +20,7 @@ list($options, $unrecognized) = cli_get_params(array(
     'users' => 0,
     'anonymize' => 0,
     'all' => false,
+    'no-recursive' => false,
     'help' => false,
     ), array('h' => 'help'));
 
@@ -45,13 +46,21 @@ if (empty($dir) || !file_exists($dir) || !is_dir($dir) || !is_writable($dir)) {
 }
 
 if (!$options['all']) {
-    // Check that the category exists.
-    if ($DB->count_records('course_categories', array('id'=>$options['categoryid'])) == 0) {
+    
+    // Get category (throws exception if not exists).
+    try {
+        $category = core_course_category::get($options['categoryid']);
+    } catch (Exception $e) {
         cli_error(get_string('nocategory', 'tool_brcli'));
-    } 
+    }
 
-    // Get courses within category.
-    $courses = $DB->get_records('course', array('category' => $options['categoryid']));
+    // Recursive by default, unless --no-recursive is set.
+    $recursive = !$options['no-recursive'];
+
+    // Get courses from category and subcategories (recursive).
+    $courses = $category->get_courses([
+        'recursive' => $recursive
+    ]);
 }
 
 if ($options['all']) {
