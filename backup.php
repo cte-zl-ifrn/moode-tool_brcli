@@ -38,6 +38,7 @@ $admin = get_admin();
 if (!$admin) {
     cli_error(get_string('noadminaccount', 'tool_brcli'));
 }
+\core\session\manager::set_user($admin);
 
 // Do we need to store backup somewhere else?
 $dir = rtrim($options['destination'], '/');
@@ -49,7 +50,11 @@ if (!$options['all']) {
     
     // Get category (throws exception if not exists).
     try {
-        $category = core_course_category::get($options['categoryid']);
+        $category = core_course_category::get(
+            $options['categoryid'],
+            IGNORE_MISSING,
+            true // inclui categorias ocultas
+        );
     } catch (Exception $e) {
         cli_error(get_string('nocategory', 'tool_brcli'));
     }
@@ -59,7 +64,8 @@ if (!$options['all']) {
 
     // Get courses from category and subcategories (recursive).
     $courses = $category->get_courses([
-        'recursive' => $recursive
+        'recursive' => $recursive,
+        'visible'   => false
     ]);
 }
 
@@ -105,7 +111,11 @@ foreach ($courses as $cs) {
 
     // Gather metadata info
     $course = get_course($cs->id);
-    $category = core_course_category::get($course->category);
+    $category = core_course_category::get(
+        $options['categoryid'],
+        IGNORE_MISSING,
+        true // inclui categorias ocultas
+    );
     $modinfo = get_fast_modinfo($course);
 
     // count modules by type
