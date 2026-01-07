@@ -77,7 +77,10 @@ $amount_of_courses = count($courses);
 
 $index = 1;
 
-$final_metadata_list = [];
+$final_export = [];
+
+// Prepara o handler fora do loop
+$custom_field_handler = \core_customfield\handler::get_handler('core_course', 'course');
 
 foreach ($courses as $cs) {
     $bc = new backup_controller(backup::TYPE_1COURSE, $cs->id, backup::FORMAT_MOODLE,
@@ -111,51 +114,98 @@ foreach ($courses as $cs) {
     $results = $bc->get_results();
     $file = $results['backup_destination']; // May be empty if file already moved to target location.
 
+
+
     // Gather metadata info
     $course = get_course($cs->id);
-    $category = core_course_category::get(
-        $course->category,
-        IGNORE_MISSING,
-        true // inclui categorias ocultas
-    );
-    $category_name = $category_object ? $category_object->name : 'N/A';
-    $category_id = $category_object ? $category_object->id : 0;
+    $course_data = (array) $course;
 
-    $modinfo = get_fast_modinfo($course);
+    $all_fields_data = $custom_field_handler->get_instance_data($course->id);
 
-    // count modules by type
-    $usedmods = [];
-    foreach ($modinfo->get_cms() as $cm) {
-        $usedmods[$cm->modname] = true;
+    $grouped_fields = [];
+
+    foreach ($all_fields_data as $d) {
+        $field = $d->get_field();
+        $category = $field->get_category();
+        
+        $cat_name = $category->get('name');
+        $field_shortname = $field->get('shortname');
+        $field_type = $field->get('type'); // date, text, select, checkbox, etc.
+        
+        // 1. Pegamos o valor bruto do banco de dados (sem processamento)
+        $raw_value = $d->get_value();
+        
+        // 2. Tentamos pegar o valor formatado (pode vir vazio dependendo do tipo)
+        $formatted_value = $d->export_value();
+
+        // Inicializa a categoria se não existir
+        if (!isset($grouped_fields[$cat_name])) {
+            $grouped_fields[$cat_name] = [];
+        }
+
+        // Para garantir que não percamos nada, vamos salvar um objeto com tudo
+        $grouped_fields[$cat_name][$field_shortname] = [
+            'raw'       => $raw_value,       // O dado real (ID, Timestamp, 0 ou 1)
+            'formatted' => $formatted_value, // O dado visual
+            'type'      => $field_type       // O tipo do campo para você saber tratar depois
+        ];
     }
-
-    // count roles
+    
+    $course_data['custom_fields'] = $grouped_fields;
+    
+    
     $context = context_course::instance($course->id);
-    $rolecounts = get_role_users(null, $context, false);
-    $roles = [];
-    foreach ($rolecounts as $u) {
-        $roles[$u->roleshortname] = isset($roles[$u->roleshortname]) ? $roles[$u->roleshortname] + 1 : 1;
+
+    $all_role_users = get_role_users(
+        null, 
+        $context, 
+        false, 
+        'u.*, r.shortname as roleshortname, r.name as rolename'
+    );
+
+    $staff_map = [];
+
+    foreach ($all_role_users as $u) {
+        // FILTRO: Ignora se o papel for estudante
+        if ($u->roleshortname === 'student') {
+            continue;
+        }
+
+        // Remove a senha (hash) por segurança, mesmo sendo "excesso",
+        // nunca é bom ter hash de senha em arquivo texto.
+        unset($u->password);
+
+        // O usuário já existe no array temporário? (Caso ele tenha 2 papéis, ex: tutor e professor)
+        if (!isset($staff_map[$u->id])) {
+            // Cria a base do usuário convertendo o objeto todo para array
+            $user_base = (array) $u;
+            
+            // Remove os campos "soltos" de role da raiz do objeto do usuário para organizar melhor
+            unset($user_base['roleshortname']);
+            unset($user_base['rolename']);
+
+            // Inicializa array de roles
+            $user_base['roles_in_course'] = [];
+
+            $staff_map[$u->id] = $user_base;
+        }
+
+        // Adiciona o papel atual à lista de papéis desse usuário
+        $staff_map[$u->id]['roles_in_course'][] = [
+            'shortname' => $u->roleshortname, // ex: editingteacher
+            'name'      => $u->rolename       // ex: Professor
+        ];
     }
 
-    // build metadata array
-    $metadata = [
-        'id' => $course->id,
-        'fullname' => $course->fullname,
-        'shortname' => $course->shortname,
-        'idnumber' => $course->idnumber,
-        'category' => $category_name,
-        'categoryid' => $category_id,
-        'groups_count' => count(groups_get_all_groups($course->id)),
-        'groupings_count' => count(groups_get_all_groupings($course->id)),
-        'roles' => $roles,
-        'format' => $course->format,
-        'modules' => array_keys($usedmods),
-        'backup_date' => date('c'),
-        'mbz_file' => $filename
-    ];
+    // Adiciona a lista de staff ao objeto do curso
+    // array_values reseta as chaves para ficar uma lista perfeita no JSON [{}, {}]
+    $course_data['staff_members'] = array_values($staff_map);
+    
+    // Informações extras do backup (opcional, mas útil para vincular o json ao arquivo .mbz)
+    $course_data['backup_file'] = $filename;
 
-    // write metadata JSON
-    $final_metadata_list[] = $metadata;
+    // 3. Acumula no array final
+    $final_export[] = $course_data;
 
     // Do we need to store backup somewhere else?
     if ($file) {
@@ -170,9 +220,16 @@ foreach ($courses as $cs) {
 }
 
 $final_json_filename = 'backup_summary_' . date('Ymd_His') . '.json';
-file_put_contents($dir . '/' . $final_json_filename, json_encode($final_metadata_list, JSON_PRETTY_PRINT));
 
-mtrace("Metadata summary saved to: " . $final_json_filename);
+$json_content = json_encode($final_export, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+
+if ($json_content === false) {
+    mtrace("Erro ao gerar JSON: " . json_last_error_msg());
+} else {
+    file_put_contents($dir . '/' . $final_json_filename, $json_content);
+    mtrace("Arquivo JSON consolidado salvo em: " . $final_json_filename);
+}
+
 mtrace(get_string('operationdone', 'tool_brcli'));
 
 exit(0);
