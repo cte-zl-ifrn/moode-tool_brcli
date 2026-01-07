@@ -77,6 +77,8 @@ $amount_of_courses = count($courses);
 
 $index = 1;
 
+$final_metadata_list = [];
+
 foreach ($courses as $cs) {
     $bc = new backup_controller(backup::TYPE_1COURSE, $cs->id, backup::FORMAT_MOODLE,
                                 backup::INTERACTIVE_YES, backup::MODE_GENERAL, $admin->id);
@@ -112,10 +114,13 @@ foreach ($courses as $cs) {
     // Gather metadata info
     $course = get_course($cs->id);
     $category = core_course_category::get(
-        $options['categoryid'],
+        $course->category,
         IGNORE_MISSING,
         true // inclui categorias ocultas
     );
+    $category_name = $category_object ? $category_object->name : 'N/A';
+    $category_id = $category_object ? $category_object->id : 0;
+
     $modinfo = get_fast_modinfo($course);
 
     // count modules by type
@@ -138,8 +143,8 @@ foreach ($courses as $cs) {
         'fullname' => $course->fullname,
         'shortname' => $course->shortname,
         'idnumber' => $course->idnumber,
-        'category' => $category->name,
-        'categoryid' => $category->id,
+        'category' => $category_name,
+        'categoryid' => $category_id,
         'groups_count' => count(groups_get_all_groups($course->id)),
         'groupings_count' => count(groups_get_all_groupings($course->id)),
         'roles' => $roles,
@@ -150,7 +155,7 @@ foreach ($courses as $cs) {
     ];
 
     // write metadata JSON
-    file_put_contents($dir . '/' . $filename . '.json', json_encode($metadata, JSON_PRETTY_PRINT));
+    $final_metadata_list[] = $metadata;
 
     // Do we need to store backup somewhere else?
     if ($file) {
@@ -163,6 +168,11 @@ foreach ($courses as $cs) {
     $bc->destroy();
     $index = $index + 1;
 }
+
+$final_json_filename = 'backup_summary_' . date('Ymd_His') . '.json';
+file_put_contents($dir . '/' . $final_json_filename, json_encode($final_metadata_list, JSON_PRETTY_PRINT));
+
+mtrace("Metadata summary saved to: " . $final_json_filename);
 mtrace(get_string('operationdone', 'tool_brcli'));
 
 exit(0);
