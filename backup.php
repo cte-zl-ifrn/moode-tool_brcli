@@ -206,9 +206,24 @@ $backups_export = [];
 $final_export = [];
 $handler = \core_customfield\handler::get_handler('core_course', 'course');
 
+$total = count($courses);
+$counter = 0;
+
 foreach ($courses as $cs) {
+    
+    $counter++;
+    
+    $percent = round(($counter / $total) * 100, 2);
+    
+    mtrace(sprintf(
+        '[%d/%d | %s%%] Processando curso: %s',
+        $counter,
+        $total,
+        $percent,
+        $course->shortname
+    ));
+    
     $course = get_course($cs->id);
-    mtrace("Processando curso: {$course->shortname}");
 
     $course_data = [];
 
@@ -232,8 +247,8 @@ foreach ($courses as $cs) {
             $filename_users = $backup_users['filename'];
 
             // garante que termina com .mbz
-            if (str_ends_with($filename_users, '.mbz')) {
-                $filename_nu = str_replace('.mbz', '-nu.mbz', $filename_users);
+            if (substr($filename_users, -4) === '.mbz') {
+                $filename_nu = substr($filename_users, 0, -4) . '-nu.mbz';
             } else {
                 $filename_nu = $filename_users . '-nu';
             }
