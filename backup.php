@@ -14,15 +14,16 @@ require_once($CFG->libdir.'/clilib.php');
 require_once($CFG->dirroot . '/backup/util/includes/backup_includes.php');
 
 // Now get cli options.
-list($options, $unrecognized) = cli_get_params(array(
-    'categoryid' => false,
-    'destination' => '',
-    'users' => 0,
-    'anonymize' => 0,
-    'all' => false,
+list($options, $unrecognized) = cli_get_params([
+    'categoryid'   => false,
+    'destination'  => '',
+    'users'        => 0,
+    'anonymize'    => 0,
+    'all'          => false,
     'no-recursive' => false,
-    'help' => false,
-    ), array('h' => 'help'));
+    'export'       => 'all', // json | backup | all
+    'help'         => false,
+], ['h' => 'help']);
 
 if ($unrecognized) {
     $unrecognized = implode("\n  ", $unrecognized);
@@ -45,6 +46,9 @@ $dir = rtrim($options['destination'], '/');
 if (empty($dir) || !file_exists($dir) || !is_dir($dir) || !is_writable($dir)) {
     cli_error(get_string('directoryerror', 'tool_brcli'));
 }
+
+$dojson   = in_array($options['export'], ['json', 'all']);
+$dobackup = in_array($options['export'], ['backup', 'all']);
 
 if (!$options['all']) {
     
@@ -73,161 +77,216 @@ if ($options['all']) {
     // Get ALL courses except frontpage.
     $courses = $DB->get_records_select('course', 'id > 1');
 }
-$amount_of_courses = count($courses);
 
-$index = 1;
+function export_course_metadata(stdClass $course, \core_customfield\handler $handler): array {
+    global $DB;
 
-$final_export = [];
-
-// Prepara o handler fora do loop
-$custom_field_handler = \core_customfield\handler::get_handler('core_course', 'course');
-
-foreach ($courses as $cs) {
-    $bc = new backup_controller(backup::TYPE_1COURSE, $cs->id, backup::FORMAT_MOODLE,
-                                backup::INTERACTIVE_YES, backup::MODE_GENERAL, $admin->id);
-
-    $settings = $bc->get_plan()->get_settings();
-
-    if (isset($settings['users'])) {
-        $settings['users']->set_value((bool)$options['users']);
-    }
-
-    if (isset($settings['anonymize'])) {
-        $settings['anonymize']->set_value((bool)$options['anonymize']);
-    }
-    
-    
-    mtrace(get_string('performingbck', 'tool_brcli', $index . '/' . $amount_of_courses));
-
-    // Set the default filename.
-    $format = $bc->get_format();
-    $type = $bc->get_type();
-    $id = $bc->get_id();
-    $users = $bc->get_plan()->get_setting('users')->get_value();
-    $anonymised = $bc->get_plan()->get_setting('anonymize')->get_value();
-    $filename = backup_plan_dbops::get_default_backup_filename($format, $type, $id, $users, $anonymised);
-    $bc->get_plan()->get_setting('filename')->set_value($filename);
-
-    // Execution.
-    $bc->finish_ui();
-    $bc->execute_plan();
-    $results = $bc->get_results();
-    $file = $results['backup_destination']; // May be empty if file already moved to target location.
-
-
-
-    // Gather metadata info
-    $course = get_course($cs->id);
     $course_data = (array) $course;
 
-    $all_fields_data = $custom_field_handler->get_instance_data($course->id);
-
+    // ---------- CUSTOM FIELDS ----------
     $grouped_fields = [];
 
-    foreach ($all_fields_data as $d) {
-        $field = $d->get_field();
-        $category = $field->get_category();
-        
-        $cat_name = $category->get('name');
-        $field_shortname = $field->get('shortname');
-        $field_type = $field->get('type'); // date, text, select, checkbox, etc.
-        
-        // 1. Pegamos o valor bruto do banco de dados (sem processamento)
-        $raw_value = $d->get_value();
-        
-        // 2. Tentamos pegar o valor formatado (pode vir vazio dependendo do tipo)
-        $formatted_value = $d->export_value();
+    $definitions = $handler->get_fields();
+    $instance_data = $handler->get_instance_data($course->id);
 
-        // Inicializa a categoria se não existir
-        if (!isset($grouped_fields[$cat_name])) {
-            $grouped_fields[$cat_name] = [];
+    foreach ($definitions as $field) {
+        $cat = $field->get_category();
+        $catid = $cat->get('id');
+
+        if (!isset($grouped_fields[$catid])) {
+            $grouped_fields[$catid] = [
+                'id' => $catid,
+                'name' => $cat->get('name'),
+                'fields' => []
+            ];
         }
 
-        // Para garantir que não percamos nada, vamos salvar um objeto com tudo
-        $grouped_fields[$cat_name][$field_shortname] = [
-            'raw'       => $raw_value,       // O dado real (ID, Timestamp, 0 ou 1)
-            'formatted' => $formatted_value, // O dado visual
-            'type'      => $field_type       // O tipo do campo para você saber tratar depois
+        $data = $instance_data[$field->get('id')] ?? null;
+
+        $raw = $data ? $data->get_value() : null;
+        $formatted = $data ? $data->export_value() : null;
+
+        if (is_object($formatted) || is_array($formatted)) {
+            $formatted = json_decode(json_encode($formatted), true);
+        }
+
+        $grouped_fields[$catid]['fields'][] = [
+            'id'        => $field->get('id'),
+            'shortname' => $field->get('shortname'),
+            'type'      => $field->get('type'),
+            'raw'       => $raw,
+            'formatted' => $formatted,
         ];
     }
-    
-    $course_data['custom_fields'] = $grouped_fields;
-    
-    
+
+    $course_data['custom_fields'] = array_values($grouped_fields);
+
+    // ---------- STAFF ----------
     $context = context_course::instance($course->id);
+    $users = get_role_users(null, $context, false,
+        'u.*, r.shortname as roleshortname, r.name as rolename');
 
-    $all_role_users = get_role_users(
-        null, 
-        $context, 
-        false, 
-        'u.*, r.shortname as roleshortname, r.name as rolename'
-    );
+    $staff = [];
 
-    $staff_map = [];
-
-    foreach ($all_role_users as $u) {
-        // FILTRO: Ignora se o papel for estudante
+    foreach ($users as $u) {
         if ($u->roleshortname === 'student') {
             continue;
         }
 
-        // Remove a senha (hash) por segurança, mesmo sendo "excesso",
-        // nunca é bom ter hash de senha em arquivo texto.
         unset($u->password);
 
-        // O usuário já existe no array temporário? (Caso ele tenha 2 papéis, ex: tutor e professor)
-        if (!isset($staff_map[$u->id])) {
-            // Cria a base do usuário convertendo o objeto todo para array
-            $user_base = (array) $u;
-            
-            // Remove os campos "soltos" de role da raiz do objeto do usuário para organizar melhor
-            unset($user_base['roleshortname']);
-            unset($user_base['rolename']);
-
-            // Inicializa array de roles
-            $user_base['roles_in_course'] = [];
-
-            $staff_map[$u->id] = $user_base;
+        if (!isset($staff[$u->id])) {
+            $staff[$u->id] = (array) $u;
+            unset($staff[$u->id]['roleshortname'], $staff[$u->id]['rolename']);
+            $staff[$u->id]['roles_in_course'] = [];
         }
 
-        // Adiciona o papel atual à lista de papéis desse usuário
-        $staff_map[$u->id]['roles_in_course'][] = [
-            'shortname' => $u->roleshortname, // ex: editingteacher
-            'name'      => $u->rolename       // ex: Professor
+        $staff[$u->id]['roles_in_course'][] = [
+            'shortname' => $u->roleshortname,
+            'name' => $u->rolename
         ];
     }
 
-    // Adiciona a lista de staff ao objeto do curso
-    // array_values reseta as chaves para ficar uma lista perfeita no JSON [{}, {}]
-    $course_data['staff_members'] = array_values($staff_map);
-    
-    // Informações extras do backup (opcional, mas útil para vincular o json ao arquivo .mbz)
-    $course_data['backup_file'] = $filename;
+    $course_data['staff_members'] = array_values($staff);
 
-    // 3. Acumula no array final
-    $final_export[] = $course_data;
-
-    // Do we need to store backup somewhere else?
-    if ($file) {
-        if ($file->copy_content_to($dir.'/'.$filename)) {
-            $file->delete();
-        } else {
-            mtrace(get_string('directoryerror', 'tool_brcli'));
-        }
-    }
-    $bc->destroy();
-    $index = $index + 1;
+    return $course_data;
 }
 
-$final_json_filename = 'backup_summary_' . date('Ymd_His') . '.json';
 
-$json_content = json_encode($final_export, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+function generate_course_backup(stdClass $course, bool $withusers, string $dir): ?array {
+    global $admin;
 
-if ($json_content === false) {
-    mtrace("Erro ao gerar JSON: " . json_last_error_msg());
-} else {
-    file_put_contents($dir . '/' . $final_json_filename, $json_content);
-    mtrace("Arquivo JSON consolidado salvo em: " . $final_json_filename);
+    $bc = new backup_controller(
+        backup::TYPE_1COURSE,
+        $course->id,
+        backup::FORMAT_MOODLE,
+        backup::INTERACTIVE_NO,
+        backup::MODE_GENERAL,
+        $admin->id
+    );
+
+    $plan = $bc->get_plan();
+    $plan->get_setting('users')->set_value($withusers);
+    $plan->get_setting('anonymize')->set_value(!$withusers);
+
+    $filename = backup_plan_dbops::get_default_backup_filename(
+        $bc->get_format(),
+        $bc->get_type(),
+        $bc->get_id(),
+        $withusers,
+        !$withusers
+    );
+
+    $plan->get_setting('filename')->set_value($filename);
+
+    $bc->execute_plan();
+    $results = $bc->get_results();
+    $file = $results['backup_destination'] ?? null;
+
+    if ($file && $file->copy_content_to($dir.'/'.$filename)) {
+        $file->delete();
+        $bc->destroy();
+
+        return [
+            'with_users'   => $withusers,
+            'filename'     => $filename,
+            'filesize'     => filesize($dir.'/'.$filename),
+            'generated_at' => date(DATE_ATOM),
+        ];
+    }
+
+    $bc->destroy();
+    return null;
+}
+
+
+$courses_export = [];
+$backups_export = [];
+
+$final_export = [];
+$handler = \core_customfield\handler::get_handler('core_course', 'course');
+
+foreach ($courses as $cs) {
+    $course = get_course($cs->id);
+    mtrace("Processando curso: {$course->shortname}");
+
+    $course_data = [];
+
+    if ($dojson) {
+        $course_data = export_course_metadata($course, $handler);
+        $courses_export[] = $course_data;
+    }
+
+    if ($dobackup) {
+
+        // 1️⃣ Backup COM usuários (já gerado)
+        $backup_users = generate_course_backup($course, true, $dir);
+
+        if ($backup_users && !empty($backup_users['filename'])) {
+
+            // Registra backup COM usuários
+            $backup_users['course_id'] = $course->id;
+            $backups_export[] = $backup_users;
+
+            // 2️⃣ Deriva o filename SEM usuários
+            $filename_users = $backup_users['filename'];
+
+            // garante que termina com .mbz
+            if (str_ends_with($filename_users, '.mbz')) {
+                $filename_nu = str_replace('.mbz', '-nu.mbz', $filename_users);
+            } else {
+                $filename_nu = $filename_users . '-nu';
+            }
+
+            // 3️⃣ Registra backup SEM usuários (sem gerar arquivo)
+            $backups_export[] = [
+                'with_users'   => false,
+                'filename'     => $filename_nu,
+                'generated_at' => date(DATE_ATOM),
+                'course_id'    => $course->id,
+            ];
+        }
+
+        // foreach ([false, true] as $withusers) {
+        //     $backup = generate_course_backup($course, $withusers, $dir);
+
+        //     if ($backup) {
+        //         // 🔑 CHAVE ESTRANGEIRA
+        //         $backup['course_id'] = $course->id;
+
+        //         $backups_export[] = $backup;
+        //     }
+        // }
+    }
+}
+
+if ($dojson) {
+    $filename = 'courses_' . date('Ymd_His') . '.json';
+    file_put_contents(
+        $dir . '/' . $filename,
+        json_encode([
+            'schema_version' => '1.0',
+            'generated_at'   => date(DATE_ATOM),
+            'courses'        => $courses_export
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)
+    );
+
+    mtrace("JSON de cursos salvo em {$filename}");
+}
+
+if ($dobackup) {
+    $filename = 'course_backups_' . date('Ymd_His') . '.json';
+
+    file_put_contents(
+        $dir . '/' . $filename,
+        json_encode([
+            'schema_version' => '1.0',
+            'generated_at'   => date(DATE_ATOM),
+            'backups'        => $backups_export
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)
+    );
+
+    mtrace("JSON de backups salvo em {$filename}");
 }
 
 mtrace(get_string('operationdone', 'tool_brcli'));
