@@ -5,7 +5,7 @@
  * @package admin
  * @subpackage tool
  * @author Paulo Júnior <pauloa.junior@ufla.br> based on /admin/cli/backup.php
- * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ * @license http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 define('CLI_SCRIPT', 1);
 
@@ -15,14 +15,10 @@ require_once($CFG->dirroot . '/backup/util/includes/backup_includes.php');
 
 // Now get cli options.
 list($options, $unrecognized) = cli_get_params([
-    'categoryid'   => false,
-    'destination'  => '',
-    'users'        => 0,
-    'anonymize'    => 0,
-    'all'          => false,
-    'no-recursive' => false,
-    'export'       => 'all', // json | backup | all
-    'help'         => false,
+    'destination' => '',
+    'users'       => 0,
+    'export'      => 'all', // json | backup | all
+    'help'        => false,
 ], ['h' => 'help']);
 
 if ($unrecognized) {
@@ -30,8 +26,15 @@ if ($unrecognized) {
     cli_error(get_string('unknowoption', 'tool_brcli', $unrecognized));
 }
 
-if ($options['help'] || (!$options['all'] && !$options['categoryid']) || !$options['destination']) {
-    echo get_string('helpoptionbck', 'tool_brcli');
+if ($options['help'] || !$options['destination']) {
+    echo "Backup de todos os cursos do Moodle\n\n";
+    echo "Opções:\n";
+    echo "  --destination=PATH    Diretório onde salvar os backups (obrigatório)\n";
+    echo "  --users=0|1           1=com usuários, 0=sem usuários (padrão: 0)\n";
+    echo "  --export=all|json|backup  O que exportar (padrão: all)\n";
+    echo "  -h, --help            Exibe esta ajuda\n\n";
+    echo "Exemplo:\n";
+    echo "  php backup.php --destination=/var/backups/moodle --users=1\n\n";
     die;
 }
 
@@ -41,7 +44,7 @@ if (!$admin) {
 }
 \core\session\manager::set_user($admin);
 
-// Do we need to store backup somewhere else?
+// Verifica diretório de destino
 $dir = rtrim($options['destination'], '/');
 if (empty($dir) || !file_exists($dir) || !is_dir($dir) || !is_writable($dir)) {
     cli_error(get_string('directoryerror', 'tool_brcli'));
@@ -49,34 +52,10 @@ if (empty($dir) || !file_exists($dir) || !is_dir($dir) || !is_writable($dir)) {
 
 $dojson   = in_array($options['export'], ['json', 'all']);
 $dobackup = in_array($options['export'], ['backup', 'all']);
+$withusers = (bool) $options['users'];
 
-if (!$options['all']) {
-    
-    // Get category (throws exception if not exists).
-    try {
-        $category = core_course_category::get(
-            $options['categoryid'],
-            IGNORE_MISSING,
-            true // inclui categorias ocultas
-        );
-    } catch (Exception $e) {
-        cli_error(get_string('nocategory', 'tool_brcli'));
-    }
-
-    // Recursive by default, unless --no-recursive is set.
-    $recursive = !$options['no-recursive'];
-
-    // Get courses from category and subcategories (recursive).
-    $courses = $category->get_courses([
-        'recursive' => $recursive,
-        'visible'   => false
-    ]);
-}
-
-if ($options['all']) {
-    // Get ALL courses except frontpage.
-    $courses = $DB->get_records_select('course', 'id > 1');
-}
+// Busca todos os cursos exceto frontpage
+$courses = $DB->get_records_select('course', 'id > 1');
 
 function export_course_metadata(stdClass $course, \core_customfield\handler $handler): array {
     global $DB;
@@ -85,7 +64,6 @@ function export_course_metadata(stdClass $course, \core_customfield\handler $han
 
     // ---------- CUSTOM FIELDS ----------
     $grouped_fields = [];
-
     $definitions = $handler->get_fields();
     $instance_data = $handler->get_instance_data($course->id);
 
@@ -102,7 +80,6 @@ function export_course_metadata(stdClass $course, \core_customfield\handler $han
         }
 
         $data = $instance_data[$field->get('id')] ?? null;
-
         $raw = $data ? $data->get_value() : null;
         $formatted = $data ? $data->export_value() : null;
 
@@ -152,7 +129,6 @@ function export_course_metadata(stdClass $course, \core_customfield\handler $han
     return $course_data;
 }
 
-
 function generate_course_backup(stdClass $course, bool $withusers, string $dir): ?array {
     global $admin;
 
@@ -168,6 +144,14 @@ function generate_course_backup(stdClass $course, bool $withusers, string $dir):
     $plan = $bc->get_plan();
     $plan->get_setting('users')->set_value($withusers);
     $plan->get_setting('anonymize')->set_value(!$withusers);
+
+    if ($plan->get_setting('logs')) {
+        $plan->get_setting('logs')->set_value(0); 
+    }
+    
+    if ($plan->get_setting('grade_histories')) {
+        $plan->get_setting('grade_histories')->set_value(0);
+    }
 
     $filename = backup_plan_dbops::get_default_backup_filename(
         $bc->get_format(),
@@ -188,6 +172,7 @@ function generate_course_backup(stdClass $course, bool $withusers, string $dir):
         $bc->destroy();
 
         return [
+            'course_id'    => $course->id,
             'with_users'   => $withusers,
             'filename'     => $filename,
             'filesize'     => filesize($dir.'/'.$filename),
@@ -200,81 +185,81 @@ function generate_course_backup(stdClass $course, bool $withusers, string $dir):
 }
 
 
+$state_file = $dir . '/backup_state_' . date('Ymd') . '.json';
+$processed_courses = [];
+
+// Carrega estado anterior se existir
+if (file_exists($state_file)) {
+    $state_data = json_decode(file_get_contents($state_file), true);
+    $processed_courses = $state_data['processed_courses'] ?? [];
+    mtrace(sprintf('Retomando backup: %d cursos já processados', count($processed_courses)));
+}
+
 $courses_export = [];
 $backups_export = [];
-
-$final_export = [];
 $handler = \core_customfield\handler::get_handler('core_course', 'course');
 
 $total = count($courses);
 $counter = 0;
 
 foreach ($courses as $cs) {
-    
     $counter++;
-    
+
+    // Pula cursos já processados
+    if (in_array($cs->id, $processed_courses)) {
+        mtrace(sprintf('[%d/%d] Pulando curso já processado: ID %d', $counter, $total, $cs->id));
+        continue;
+    }
+
     $percent = round(($counter / $total) * 100, 2);
+    $course = get_course($cs->id);
     
     mtrace(sprintf(
-        '[%d/%d | %s%%] Processando curso: %s',
+        '[%d/%d | %s%%] Processando curso: %s (ID: %d)',
         $counter,
         $total,
         $percent,
-        $course->shortname
+        $course->shortname,
+        $course->id
     ));
-    
-    $course = get_course($cs->id);
 
-    $course_data = [];
-
-    if ($dojson) {
-        $course_data = export_course_metadata($course, $handler);
-        $courses_export[] = $course_data;
-    }
-
-    if ($dobackup) {
-
-        // 1️⃣ Backup COM usuários (já gerado)
-        $backup_users = generate_course_backup($course, true, $dir);
-
-        if ($backup_users && !empty($backup_users['filename'])) {
-
-            // Registra backup COM usuários
-            $backup_users['course_id'] = $course->id;
-            $backups_export[] = $backup_users;
-
-            // 2️⃣ Deriva o filename SEM usuários
-            $filename_users = $backup_users['filename'];
-
-            // garante que termina com .mbz
-            if (substr($filename_users, -4) === '.mbz') {
-                $filename_nu = substr($filename_users, 0, -4) . '-nu.mbz';
-            } else {
-                $filename_nu = $filename_users . '-nu';
-            }
-
-            // 3️⃣ Registra backup SEM usuários (sem gerar arquivo)
-            $backups_export[] = [
-                'with_users'   => false,
-                'filename'     => $filename_nu,
-                'generated_at' => date(DATE_ATOM),
-                'course_id'    => $course->id,
-            ];
+    try {
+        // Exporta metadados JSON
+        if ($dojson) {
+            $course_data = export_course_metadata($course, $handler);
+            $courses_export[] = $course_data;
         }
 
-        // foreach ([false, true] as $withusers) {
-        //     $backup = generate_course_backup($course, $withusers, $dir);
-
-        //     if ($backup) {
-        //         // 🔑 CHAVE ESTRANGEIRA
-        //         $backup['course_id'] = $course->id;
-
-        //         $backups_export[] = $backup;
-        //     }
-        // }
+        // Gera backup
+        if ($dobackup) {
+            $backup = generate_course_backup($course, $withusers, $dir);
+            
+            if ($backup) {
+                $backups_export[] = $backup;
+            }
+        }
+        
+        // Marca curso como processado
+        $processed_courses[] = $cs->id;
+        
+        // Salva estado a cada curso processado
+        file_put_contents(
+            $state_file,
+            json_encode([
+                'last_updated' => date(DATE_ATOM),
+                'processed_courses' => $processed_courses,
+                'total_courses' => $total
+            ], JSON_PRETTY_PRINT)
+        );
+        
+    } catch (Exception $e) {
+        mtrace('ERRO ao processar curso ' . $cs->id . ': ' . $e->getMessage());
+        // Continua para o próximo curso mesmo em caso de erro
+        continue;
     }
 }
 
+// Salva JSON de cursos
 if ($dojson) {
     $filename = 'courses_' . date('Ymd_His') . '.json';
     file_put_contents(
@@ -289,6 +274,7 @@ if ($dojson) {
     mtrace("JSON de cursos salvo em {$filename}");
 }
 
+// Salva JSON de backups
 if ($dobackup) {
     $filename = 'course_backups_' . date('Ymd_His') . '.json';
 
@@ -297,6 +283,7 @@ if ($dobackup) {
         json_encode([
             'schema_version' => '1.0',
             'generated_at'   => date(DATE_ATOM),
+            'with_users'     => $withusers,
             'backups'        => $backups_export
         ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)
     );
