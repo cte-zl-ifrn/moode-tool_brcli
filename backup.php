@@ -185,18 +185,35 @@ function generate_course_backup(stdClass $course, bool $withusers, string $dir):
 }
 
 
-$state_file = $dir . '/backup_state_' . date('Ymd') . '.json';
-$processed_courses = [];
+$state_file = $dir . '/backup_state_in_progress.json';
+$processed_json = [];
+$processed_backup = [];
+// $processed_courses = [];
+$courses_export = [];
+$backups_export = [];
 
 // Carrega estado anterior se existir
 if (file_exists($state_file)) {
     $state_data = json_decode(file_get_contents($state_file), true);
-    $processed_courses = $state_data['processed_courses'] ?? [];
-    mtrace(sprintf('Retomando backup: %d cursos já processados', count($processed_courses)));
+
+    $processed_json = $state_data['processed_json'] ?? [];
+    $processed_backup = $state_data['processed_backup'] ?? [];
+
+    if ($dojson && isset($state_data['courses_data'])) {
+        $courses_export = $state_data['courses_data'];
+    }
+    
+    if ($dobackup && isset($state_data['backups_data'])) {
+        $backups_export = $state_data['backups_data'];
+    }
+
+    mtrace(sprintf(
+        'Retomando backup: %d JSONS e %d backups processados',
+        count($processed_json),
+        count($processed_backup)
+    ));
 }
 
-$courses_export = [];
-$backups_export = [];
 $handler = \core_customfield\handler::get_handler('core_course', 'course');
 
 $total = count($courses);
@@ -205,14 +222,22 @@ $counter = 0;
 foreach ($courses as $cs) {
     $counter++;
 
+    // Verifica se precisa processar este curso
+    $need_json = $dojson && !in_array($cs->id, $processed_json);
+    $need_backup = $dobackup && !in_array($cs->id, $processed_backup);
+
     // Pula cursos já processados
-    if (in_array($cs->id, $processed_courses)) {
+    if (!$need_json && !$need_backup) {
         mtrace(sprintf('[%d/%d] Pulando curso já processado: ID %d', $counter, $total, $cs->id));
         continue;
     }
 
     $percent = round(($counter / $total) * 100, 2);
     $course = get_course($cs->id);
+
+    $operations = [];
+    if ($need_json) $operations[] = 'JSON';
+    if ($need_backup) $operations[] = 'BACKUP';
     
     mtrace(sprintf(
         '[%d/%d | %s%%] Processando curso: %s (ID: %d)',
@@ -220,38 +245,50 @@ foreach ($courses as $cs) {
         $total,
         $percent,
         $course->shortname,
-        $course->id
+        $course->id,
+        implode(', ', $operations)
     ));
 
     try {
         // Exporta metadados JSON
-        if ($dojson) {
+        if ($need_json) {
             $course_data = export_course_metadata($course, $handler);
             $courses_export[] = $course_data;
+            $processed_json[] = $cs->id;
         }
 
         // Gera backup
-        if ($dobackup) {
+        if ($need_backup) {
             $backup = generate_course_backup($course, $withusers, $dir);
             
             if ($backup) {
                 $backups_export[] = $backup;
+                $processed_backup[] = $cs->id;
             }
         }
         
-        // Marca curso como processado
-        $processed_courses[] = $cs->id;
-        
         // Salva estado a cada curso processado
+        $state_to_save = [
+            'last_updated' => date(DATE_ATOM),
+            'processed_json' => $processed_json,
+            'processed_backup' => $processed_backup,
+            'total_courses' => $total
+        ];
+
+        // Salva dados parciais para retomada
+        if ($dojson) {
+            $state_to_save['courses_data'] = $courses_export;
+        }
+
+        if ($dobackup) {
+            $state_to_save['backups_data'] = $backups_export;
+        }
+
         file_put_contents(
             $state_file,
-            json_encode([
-                'last_updated' => date(DATE_ATOM),
-                'processed_courses' => $processed_courses,
-                'total_courses' => $total
-            ], JSON_PRETTY_PRINT)
+            json_encode($state_to_save, JSON_PRETTY_PRINT)
         );
-        
+
     } catch (Exception $e) {
         mtrace('ERRO ao processar curso ' . $cs->id . ': ' . $e->getMessage());
         // Continua para o próximo curso mesmo em caso de erro
